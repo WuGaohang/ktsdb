@@ -1,0 +1,1 @@
+gcc -o ktsdb_test -lleveldb db.c dstr.c mem.c ktsdb_test.c
