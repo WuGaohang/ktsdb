@@ -72,7 +72,7 @@ int main(int argc , char *argv[])
 	db_ro = db_readoptions_create();
 	
 	//tmp: address
-	tmp = "/home/vincent/file/ktsdb/ktsdb_socket";
+	tmp = "/home/vincent/file/ktsdb/ktsdb_socket/leveldb";
 	db = db_open(db_o, tmp, &dberr);
 	if (dberr)
 	{
@@ -83,6 +83,7 @@ int main(int argc , char *argv[])
 	{
 //		db_put(db, db_wo, dstr_input_key, dstr_length(dstr_input_key), dstr_input_value, dstr_length(dstr_input_value), &dberr);
 		printf("write %s\n",input_key);
+		printf("len in:%d\n",strlen(input_key));
 		db_put(db, db_wo, input_key, strlen(input_key), input_value, strlen(input_value), &dberr);
 
 		if (dberr)
@@ -95,6 +96,8 @@ int main(int argc , char *argv[])
 			printf("before read:%s\n",output_value);
 			//db_get(db, db_ro, dstr_input_key, dstr_length(dstr_input_key), output_len, &dberr);
 			output_value = db_get(db, db_ro, input_key, strlen(input_key), output_len, &dberr);
+			printf("len out:%d\n",*output_len);
+			output_value[*output_len] = '\0';
 			printf("after read:%s\n",output_value);
 		}
 	}
