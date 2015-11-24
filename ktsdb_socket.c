@@ -32,11 +32,8 @@ static struct socket *serversocket=NULL;
 static DECLARE_COMPLETION(threadcomplete);
 static int ktsdb_socket_server_pid;
 
-static unsigned char array[100];
 static unsigned char *buffers;
-static int arr_len = 0;
 //---------------------------------------mmap------------------------------------------------------------------
-
 
 static int my_open(struct inode *inode, struct file *file)
 {
@@ -47,45 +44,21 @@ static int my_open(struct inode *inode, struct file *file)
 static int my_map(struct file *filp, struct vm_area_struct *vma)
 {    
 	unsigned long page;
-	unsigned char i;
 	unsigned long start = (unsigned long)vma->vm_start;
 	unsigned long size = (unsigned long)(vma->vm_end - vma->vm_start);
 	page = virt_to_phys(buffers);
  
 	if(remap_pfn_range(vma,start,page>>PAGE_SHIFT,size,PAGE_SHARED))
-	return -1;
-
-	for(i=0;i<arr_len;i++)
-		buffers[i] = array[i];
-	return 0;
-}
-/*
-static int my_write(struct file *filp, struct vm_area_struct *vma)
-{
-//	unsigned long page;
-	unsigned char i;
-
-	printk("buf %s   vma:%p\n",array,vma);
-	unsigned long start = (unsigned long)vma->vm_start;
-	unsigned long size = (unsigned long)(vma->vm_end - vma->vm_start);
-
-	page = virt_to_phys(buffers);
-
-	if(remap_pfn_range(vma,start,page>>PAGE_SHIFT,size,PAGE_SHARED))
 		return -1;
 
-	for(i=0;i<arr_len;i++)
-		buffers[i] = array[i];
-
 	return 0;
 }
-*/
+
 
 static struct file_operations dev_fops = {
 	.owner    = THIS_MODULE,
 	.open    = my_open,
 	.mmap   = my_map,
-//	.write = my_write,
 };
 
 static struct miscdevice misc = {
@@ -97,11 +70,12 @@ static struct miscdevice misc = {
 
 static int dev_init()
 {
+
 	int ret;
 
-	ret = misc_register(&misc);
 	buffers = (unsigned char *)kmalloc(PAGE_SIZE,GFP_KERNEL);
 	SetPageReserved(virt_to_page(buffers));
+	ret = misc_register(&misc);
 
 	return ret;
 }
@@ -127,8 +101,10 @@ static int create_socket(void)
 	server.sin_family = AF_INET;
 	server.sin_addr.s_addr = INADDR_ANY;
 	server.sin_port = htons((unsigned short)server_port);
+printk(KERN_ERR "%p | %p\n",serversocket,server);
 	servererror = kernel_bind(serversocket,
 			(struct sockaddr *) &server, sizeof(server));
+printk(KERN_ERR "%d\n",servererror);
 	if(servererror)
 		goto release;
 	servererror = kernel_listen(serversocket, 3);
@@ -147,7 +123,6 @@ static struct socket *socket_accept(struct socket *server)
 	struct sockaddr address;
 	int error, len;
 	struct socket *clientsocket=NULL;
-
 	if(server==NULL) return NULL;
 	error = kernel_accept(server, &clientsocket, 0);
 	if(error<0) {
@@ -155,6 +130,7 @@ static struct socket *socket_accept(struct socket *server)
 	}
 	error = kernel_getpeername(clientsocket, 
 		(struct sockaddr *)&address, &len); 
+
 	if(error<0) {
 		sock_release(clientsocket);
 		return NULL;
@@ -172,27 +148,7 @@ static int server_send(struct socket *sock, unsigned char *buf, int len)
 {
 	struct msghdr msg;
 	struct kvec iov;
-	//-------------------
-	buf[len-2] = '\0';
-	//-------------------
-//--------------------------------
-/*
-	ClearPageReserved(virt_to_page(buffers));
-	kfree(buffers);
-				
-	buffers = (unsigned char *)kmalloc(PAGE_SIZE,GFP_KERNEL);
 
-	arr_len = strlen(buffers);
-	//__get_free_pages(GFP_KERNEL, 0);
-	SetPageReserved(virt_to_page(buffers));
-	int i;
-	for(i=0;i<arr_len;i++)
-		buf[i] = buffers[i];
-*/
-//--------------------------------
-//------------------------------
-	printk("send:%s\n",buf);
-//------------------------------
 	if(sock->sk==NULL) 
 		return 0;
 	iov.iov_base = buf;
@@ -211,12 +167,7 @@ static int server_receive(struct socket *sptr, unsigned char *buf, int len)
 {
 	struct msghdr msg;
 	struct kvec iov;
-	//-------------------
-	buf[len-2] = '\0';
-	//-------------------
-//------------------------------
-	printk("recv:%s\n",buf);
-//------------------------------
+
 	if(sptr->sk==NULL) 
 	  return 0;
 	iov.iov_base = buf;
@@ -224,8 +175,7 @@ static int server_receive(struct socket *sptr, unsigned char *buf, int len)
 	msg.msg_control = NULL;
 	msg.msg_controllen = 0;
 
-	len = kernel_recvmsg(sptr, &msg, &iov, 1, len, 0);
-	
+	len = kernel_recvmsg(sptr, &msg, &iov, 1, len, 0);	
 	return len;
 }
 
@@ -245,36 +195,39 @@ static int ktsdb_socket_server(void *data)
 		printk("clientsocket(%p)\n", clientsocket);
 		while(clientsocket) {
 			len = server_receive(clientsocket, buffer, sizeof(buffer));
-
 			if(len>0) {
-				server_send(clientsocket, buffer, len); // ktsdb_socket
+				if (strstr(buffer, "\r\n") && len > 2)
+				{
+					len-=2;
+					buffer[len] = '\0';
+				}
 
-				//------------------------------------------
-				printk("len: %d\n",strlen(buffer));
 				int i = 0;
-				buffer[strlen(buffer)] = '\0';
-				arr_len = strlen(buffer)+1;				
-				
-				for (i = 0; i < arr_len; i++)
-					array[i] = buffer[i];		
 
-				
-				ClearPageReserved(virt_to_page(buffers));
-				kfree(buffers);
-				
-				buffers = (unsigned char *)kmalloc(PAGE_SIZE,GFP_KERNEL);
-				//__get_free_pages(GFP_KERNEL, 0);
-				SetPageReserved(virt_to_page(buffers));
-				for(i=0;i<arr_len;i++)
+				for (i = 0; i < len; i++)
 					buffers[i] = buffer[i];
-//				buffers[strlen(buffers)] = '\0';
-
+				buffers[len] = '\0';
+			
+				//----------------------------------------------------------------------
 				schedule_timeout_uninterruptible(5000);
+				//----------------------------------------------------------------------
 
-				//------------get db_get result from user space and send to telnet------
-//				server_send(clientsocket, buffer, len);
+				server_send(clientsocket, buffers, strlen(buffers));
+				//send \r\n for test
+				server_send(clientsocket, "\r\n", 2);
+
 				//---------------------------------------------------------------------- 
 			} else {
+		//-------------------------------------------
+		printk("sock rele 3\n");
+		//-------------------------------------------
+//--------------------------------
+//release socket time = 0
+struct linger so_linger;
+so_linger.l_onoff = 1;
+so_linger.l_linger = 0;
+kernel_setsockopt(clientsocket, SOL_SOCKET, SO_LINGER,&so_linger,sizeof(so_linger));
+//-------------------------------------------------------------------------------------------------
 				sock_release(clientsocket);
 				clientsocket=NULL;
 			}
@@ -287,17 +240,9 @@ static int ktsdb_socket_server(void *data)
 static int __init server_init(void)
 {
 //------------------------------------
-	arr_len = 20;
-	int i = 0;
-
-	char *temp = "ABCDEFGHIJABCDEFGHIJ";
-	for (i = 0; i < 20; i++)
-		array[i] = temp[i];
 	dev_init();
-
 //------------------------------------
 
-	printk("INSMOD ktsdb_socket\n");
 	if(create_socket()<0)
 		return -EIO;
 	ktsdb_socket_server_pid=kernel_thread(ktsdb_socket_server,NULL, CLONE_KERNEL);
@@ -313,10 +258,6 @@ static int __init server_init(void)
 
 static void __exit server_exit(void)
 {
-	//------------------------------
-	printk("RMMOD ktsdb_socket\n");
-	dev_free();
-	//------------------------------
 	printk("server_exit() %d\n",ktsdb_socket_server_pid);
 	if(ktsdb_socket_server_pid) {
 		kill_pid(find_pid_ns(ktsdb_socket_server_pid, &init_pid_ns),
@@ -326,6 +267,9 @@ static void __exit server_exit(void)
 	if(serversocket) {
 		sock_release(serversocket);
 	}
+	//------------------------------
+	dev_free();
+	//------------------------------
 }
 
 module_init(server_init);
