@@ -44,12 +44,12 @@ static int ktsdb_socket_server_pid;
 //static unsigned char *buffers;
 static unsigned char *read_buffers;
 static unsigned char *write_buffers;
-
+static unsigned char *timestamp;
 
 struct param_struct
 {
 	struct socket *client;
-	struct work_struct sock_work; 
+	struct work_struct sock_work;
 };
 //---------------------------------------mmap-------------------------------------------------------------
 
@@ -117,6 +117,9 @@ static int dev_init()
 
 	read_buffers = (unsigned char *)kmalloc(PAGE_SIZE,GFP_KERNEL);
 	write_buffers = (unsigned char *)kmalloc(PAGE_SIZE,GFP_KERNEL);
+
+	timestamp = (unsigned char*)kmalloc(sizeof(char)*15,GFP_KERNEL);
+
 	SetPageReserved(virt_to_page(read_buffers));
 	SetPageReserved(virt_to_page(write_buffers));
 	ret1 = misc_register(&misc_read);
@@ -133,6 +136,8 @@ static void dev_free()
 	ClearPageReserved(virt_to_page(write_buffers));
 	kfree(read_buffers);
 	kfree(write_buffers);
+
+	kfree(timestamp);
 }
 
 
@@ -231,50 +236,64 @@ static int server_receive(struct socket *sptr, unsigned char *buf, int len)
 
 static void socket_work(struct work_struct *sock_work)
 {
-
 	struct param_struct *ps = container_of(sock_work, struct param_struct, sock_work);
-	
+
 	unsigned char buffer[100];
 	static int len = 0;
+	int timestamp_len = 0;
 
 	while (1)
 	{
 		len = server_receive(ps->client, buffer, sizeof(buffer));
 		if (len > 0)
-		{	
+		{
 			if (strstr(buffer, "\r\n") && len > 2)
 			{
 				len-=2;
 				buffer[len] = '\0';
 			}
 
-			int i = 0;
-
-			for (i = 0; i < len; i++)
-				read_buffers[i] = buffer[i];
-			read_buffers[len] = '\0';
-			
-			schedule_timeout_uninterruptible(5000);
+			//add timestamp
+			sprintf(timestamp,"%ld",jiffies);
+			strcpy(read_buffers,timestamp);
+			strcat(read_buffers," ");
+			timestamp_len = strlen(timestamp);
+			len+=timestamp_len;
+			len++;
+			strcat(read_buffers,buffer);
+		
+			schedule_timeout_uninterruptible(200);
 
 			server_send(ps->client, write_buffers, strlen(write_buffers));
 			//send \r\n for test
 			server_send(ps->client, "\r\n", 2);
+
 		}
 		else if (len == 0)
 		{
+			struct linger so_linger;
+			so_linger.l_onoff = 1;
+			so_linger.l_linger = 0;
+
+			kernel_setsockopt(ps->client, SOL_SOCKET, SO_LINGER,&so_linger,sizeof(so_linger));
+
+			sock_release(ps->client);
+			ps->client = NULL;
+
 			break;
 		}
 	}
-
-	complete(&IOcomplete);
 	return;
 }
-
 
 static int ktsdb_socket_server(void *data)
 {
 	daemonize("ktsdb_socket");
 	allow_signal(SIGTERM);
+
+	struct param_struct ps[10];
+	int i = 0;
+
 	while(!signal_pending(current))
 	{
 		unsigned char buffer[100];
@@ -287,19 +306,11 @@ static int ktsdb_socket_server(void *data)
 
 		while(clientsocket)
 		{
-			struct param_struct ps;
-			ps.client = clientsocket;
-			INIT_WORK(&(ps.sock_work),socket_work);
-			queue_work(wq,&(ps.sock_work));
-			wait_for_completion(&IOcomplete);
-
-			//release socket time = 0
-			struct linger so_linger;
-			so_linger.l_onoff = 1;
-			so_linger.l_linger = 0;
-			kernel_setsockopt(clientsocket, SOL_SOCKET, SO_LINGER,&so_linger,sizeof(so_linger));
-			sock_release(clientsocket);
-			clientsocket=NULL;
+			ps[i].client = clientsocket;
+			INIT_WORK(&(ps[i].sock_work),socket_work);
+			queue_work(wq,&(ps[i].sock_work));
+			clientsocket = NULL;
+			i++;
 		}
 	}
 
@@ -310,8 +321,8 @@ static int ktsdb_socket_server(void *data)
 static int __init server_init(void)
 {
 	dev_init();
-
-	wq = create_singlethread_workqueue("workqueue");
+printk("jiff start:%ld\n",jiffies);
+	wq = create_workqueue("workqueue");
 
 	if(create_socket()<0)
 		return -EIO;
@@ -342,7 +353,7 @@ static void __exit server_exit(void)
 	}
 
 	destroy_workqueue(wq);
-
+printk("jiff end:%ld\n",jiffies);
 	dev_free();
 }
 

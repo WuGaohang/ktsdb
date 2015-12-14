@@ -10,6 +10,12 @@
 #include "db.h"
 #include "dstr.h"
 
+//------------------------------
+//poll
+#include <poll.h>
+#define TIME_DELAY 100000
+//------------------------------
+
 #define PAGE_SIZE 4096
 #define DB_ERR -1
 #define PARAM_ERR -2
@@ -22,13 +28,14 @@ char *dberr = NULL;
 static db_writeoptions_t *db_wo;
 static db_readoptions_t *db_ro;
 
-unsigned char *p_map;
+unsigned char *read_map;
+unsigned char *write_map;
 
 void usage()
 {
-	strcat(p_map, "-----------------------------\r\n");
-	strcat(p_map, "here printf usage\r\n");
-	strcat(p_map, "-----------------------------");
+	strcat(write_map, "-----------------------------\r\n");
+	strcat(write_map, "here printf usage\r\n");
+	strcat(write_map, "-----------------------------");
 }
 
 size_t put_command(dstr* fields,int count)
@@ -90,89 +97,122 @@ int main(int argc , char *argv[])
 		return 0;
 	}
 
-	int fd;
-	int i;
-    
-	fd = open("/dev/ktsdb",O_RDWR);
-	if(fd < 0)
+	int fd_read, fd_write;
+
+	fd_read = open("/dev/ktsdb_read",O_RDONLY);
+	fd_write = open("/dev/ktsdb_write",O_RDWR);
+	char *line = (char*)malloc(sizeof(char)*100);
+
+	char *prior_timestamp = (char*)malloc(sizeof(char)*100);
+	dstr *command_with_timestamp = NULL;
+	dstr *fields = NULL;
+
+	int count1 = 0;
+	int count = 0;
+
+	if (fd_read < 0||fd_write < 0)
 	{
 		printf("open fail\n");
 		exit(1);
 	}
 
-	p_map = (unsigned char *)mmap(0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,fd, 0);
-	if(p_map == MAP_FAILED)
+
+	write_map = (unsigned char *)mmap(0, PAGE_SIZE, PROT_WRITE, MAP_SHARED,fd_write, 0);
+	read_map = (unsigned char *)mmap(0, PAGE_SIZE, PROT_READ, MAP_SHARED,fd_read, 0);
+	
+	if (read_map == MAP_FAILED || write_map == MAP_FAILED)
 	{
-		printf("mmap fail\n");
-		munmap(p_map, PAGE_SIZE);
+		printf("mmap fail %p  %p\n",read_map, write_map);
+		munmap(read_map, PAGE_SIZE);
+		munmap(write_map, PAGE_SIZE);
 		return 0;
 	}
 
-	i = 0;
 
-	char *line = (char*)malloc(sizeof(char)*100);
-	
 	while (1)
 	{
-		if (p_map[i] == '\0')
-			break;
-		line[i] = p_map[i];
-		i++;
+		strcpy(line, read_map);
+		command_with_timestamp = dstr_split_len(line, strlen(line), " ", 1, &count1);
+		if (count1 > 0 && strcmp(command_with_timestamp[0],prior_timestamp))
+		{			
+			strcpy(prior_timestamp,command_with_timestamp[0]);
+			strcpy(line, read_map+strlen(command_with_timestamp[0])+1);
+
+			fields = dstr_split_len(line, strlen(line), " ", 1, &count);
+			if (count > 0)
+			{
+				if (!strcmp(fields[0], "put"))
+				{
+					int status = put_command(fields, count);
+					switch (status)
+					{
+						case DB_ERR:
+							strcpy(write_map, "put error");
+							break;
+						case PARAM_ERR:
+							strcpy(write_map, "not enough parameter");
+							usage();
+							break;
+						default:
+							strcpy(write_map, "put success");
+					}
+				}
+				else if (!strcmp(fields[0], "get"))
+				{
+					size_t *output_len = (size_t*)malloc(sizeof(size_t));
+					size_t *status = (size_t*)malloc(sizeof(size_t));
+					char *output_value = get_command(fields, count, status, output_len);
+					switch (*status)
+					{
+						case DB_ERR:
+							strcpy(write_map, "get error");
+							break;
+						case PARAM_ERR:
+							strcpy(write_map, "not enough parameter");
+							usage();
+							break;
+						case GET_NOT_FOUND:
+							strcpy(write_map, "not found");
+							break;
+						default:
+							strcpy(write_map, "Get from leveldb:");
+							strcat(write_map,output_value);
+					}
+					free(output_len);
+					free(status);
+				}
+				else
+				{
+					strcpy(write_map, "unknown command\n");
+					usage();
+				}
+			}
+			dstr_free_tokens(fields, count);
+		}
+		dstr_free_tokens(command_with_timestamp, count1);
 	}
-	line[i] = '\0';
+//----------------------------------------------------------------------------------
+/*
+	char *prior_map = (char*)malloc(sizeof(char)*100);
+	strcpy(prior_map,read_map);
 
-	dstr *fields = NULL;
-	int count = 0;
+ 	struct pollfd fds;
+	fds.fd = fd;
+	fds.events = POLLIN;
 
-	fields = dstr_split_len(line, strlen(line), " ", 1, &count);
-
-	if (count > 0)
+	while(1)
 	{
-		if (!strcmp(fields[0], "put"))
+		if (strcmp(prior_map,read_map))
 		{
-			int status = put_command(fields, count);
-			switch (status)
-			{
-				case DB_ERR:
-					strcpy(p_map, "put error");
-					break;
-				case PARAM_ERR:
-					strcpy(p_map, "not enough parameter");
-					usage();
-					break;
-				default:
-					strcpy(p_map, "put success");
-			}
-		}
-		else if (!strcmp(fields[0], "get"))
-		{
-			size_t *output_len = (size_t*)malloc(sizeof(size_t));
-			size_t *status = (size_t*)malloc(sizeof(size_t));
-			char *output_value = get_command(fields, count, status, output_len);
-			switch (*status)
-			{
-				case DB_ERR:
-					strcpy(p_map, "get error");
-					break;
-				case PARAM_ERR:
-					strcpy(p_map, "not enough parameter");
-					usage();
-					break;
-				case GET_NOT_FOUND:
-					strcpy(p_map, "not found");
-					break;
-				default:
-					strcpy(p_map, "Get from leveldb:");
-					strcat(p_map,output_value);
-			}
-		}
-		else
-		{
-			strcpy(p_map, "unknown command\n");
-			usage();
+			printf("input events\n");
+			strcpy(write_map,"from user space: input events");
 		}
 	}
-
-	munmap(p_map, PAGE_SIZE);
+*/
+//-----------------------------------------------------------------------------------
+	dstr_free(fields);
+	dstr_free(command_with_timestamp);
+	munmap(read_map, PAGE_SIZE);
+	munmap(write_map, PAGE_SIZE);
 	return 0;
 }
