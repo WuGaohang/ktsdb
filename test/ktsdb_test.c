@@ -17,9 +17,9 @@
 //------------------------------
 
 #define PAGE_SIZE 4096
-#define DB_ERR -1
-#define PARAM_ERR -2
-#define GET_NOT_FOUND -3
+#define DB_ERR -1 //DB_ERR数据库错误
+#define PARAM_ERR -2 //PARAM_ERR 命令参数错误
+#define GET_NOT_FOUND -3 //GET_NOT_FOUND get命令没有找到相应结果
 
 db_t *db;
 static db_options_t *db_o;
@@ -31,11 +31,25 @@ static db_readoptions_t *db_ro;
 unsigned char *read_map;
 unsigned char *write_map;
 
+
+//result记录返回结果
+char *result;
+
 void usage()
 {
-	strcat(write_map, "-----------------------------\r\n");
-	strcat(write_map, "here printf usage\r\n");
-	strcat(write_map, "-----------------------------");
+	strcat(result, "-----------------------------\r\n");
+	strcat(result, "here printf usage\r\n");
+	strcat(result, "-----------------------------");
+}
+
+//在字符串src之前加上前缀和空格，并将结果赋值给dest，即dest=prefix+空格+src
+void add_prefix(char* dest, char* src,char* prefix)
+{
+	char *temp = (char*)malloc(sizeof(char)*200);
+	strcpy(temp,prefix);
+	strcat(temp," ");
+	strcat(temp,src);
+	strcpy(dest,temp);
 }
 
 size_t put_command(dstr* fields,int count)
@@ -78,7 +92,7 @@ char* get_command(dstr* fields,int count, size_t *status, size_t *value_len)
 	}
 	else
 	{
-		*status PARAM_ERR;
+		*status = PARAM_ERR;
 		return;
 	}
 }
@@ -99,12 +113,18 @@ int main(int argc , char *argv[])
 
 	int fd_read, fd_write;
 
-	fd_read = open("/dev/ktsdb_read",O_RDONLY);
-	fd_write = open("/dev/ktsdb_write",O_RDWR);
-	char *line = (char*)malloc(sizeof(char)*100);
+	fd_read = open("/dev/ktsdb_read",O_RDONLY); // 只读映射
+	fd_write = open("/dev/ktsdb_write",O_RDWR); // 读写映射
 
+	//line记录发送的原始消息
+	char *line = (char*)malloc(sizeof(char)*100);
+	//prior_timestamp保存前一个时间戳
 	char *prior_timestamp = (char*)malloc(sizeof(char)*100);
-	dstr *command_with_timestamp = NULL;
+	//client保存客户端标识
+	char *client = (char*)malloc(sizeof(char)*100);
+	result= (char*)malloc(sizeof(char)*200);
+
+	dstr *command_with_prefix = NULL;
 	dstr *fields = NULL;
 
 	int count1 = 0;
@@ -115,7 +135,6 @@ int main(int argc , char *argv[])
 		printf("open fail\n");
 		exit(1);
 	}
-
 
 	write_map = (unsigned char *)mmap(0, PAGE_SIZE, PROT_WRITE, MAP_SHARED,fd_write, 0);
 	read_map = (unsigned char *)mmap(0, PAGE_SIZE, PROT_READ, MAP_SHARED,fd_read, 0);
@@ -128,15 +147,20 @@ int main(int argc , char *argv[])
 		return 0;
 	}
 
-
 	while (1)
 	{
 		strcpy(line, read_map);
-		command_with_timestamp = dstr_split_len(line, strlen(line), " ", 1, &count1);
-		if (count1 > 0 && strcmp(command_with_timestamp[0],prior_timestamp))
-		{			
-			strcpy(prior_timestamp,command_with_timestamp[0]);
-			strcpy(line, read_map+strlen(command_with_timestamp[0])+1);
+		command_with_prefix = dstr_split_len(line, strlen(line), " ", 1, &count1);
+		//通过比较当前read_map中命令的时间戳与上一条命令的时间戳来判断是否有新的命令到达
+		if (count1 > 2 && strcmp(command_with_prefix[0],prior_timestamp))
+		{
+			//初始化result;
+			strcpy(result,"");
+			//改写prior_timestamp时间戳
+			strcpy(prior_timestamp,command_with_prefix[0]);
+			//记录client标识
+			strcpy(client,command_with_prefix[1]);
+			strcpy(line, read_map+strlen(command_with_prefix[0])+strlen(command_with_prefix[1])+2);
 
 			fields = dstr_split_len(line, strlen(line), " ", 1, &count);
 			if (count > 0)
@@ -147,14 +171,14 @@ int main(int argc , char *argv[])
 					switch (status)
 					{
 						case DB_ERR:
-							strcpy(write_map, "put error");
+							strcpy(result, "put error");
 							break;
 						case PARAM_ERR:
-							strcpy(write_map, "not enough parameter");
+							strcpy(result, "not enough parameter\r\n");
 							usage();
 							break;
 						default:
-							strcpy(write_map, "put success");
+							strcpy(result, "put success");
 					}
 				}
 				else if (!strcmp(fields[0], "get"))
@@ -165,53 +189,38 @@ int main(int argc , char *argv[])
 					switch (*status)
 					{
 						case DB_ERR:
-							strcpy(write_map, "get error");
+							strcpy(result, "get error");
 							break;
 						case PARAM_ERR:
-							strcpy(write_map, "not enough parameter");
+							strcpy(result, "not enough parameter\r\n");
 							usage();
 							break;
 						case GET_NOT_FOUND:
-							strcpy(write_map, "not found");
+							strcpy(result, "not found");
 							break;
 						default:
-							strcpy(write_map, "Get from leveldb:");
-							strcat(write_map,output_value);
+							strcpy(result, "Get from leveldb:");
+							strcat(result,output_value);
 					}
 					free(output_len);
 					free(status);
 				}
 				else
 				{
-					strcpy(write_map, "unknown command\n");
+					strcpy(result, "unknown command\n");
 					usage();
 				}
-			}
+				//add_prefix: 将字符串result与prior_timestamp连接并赋值给write_map
+				add_prefix(result,result,client);
+				add_prefix(write_map,result,prior_timestamp);
+			}//end of if (count > 0)
 			dstr_free_tokens(fields, count);
 		}
-		dstr_free_tokens(command_with_timestamp, count1);
-	}
-//----------------------------------------------------------------------------------
-/*
-	char *prior_map = (char*)malloc(sizeof(char)*100);
-	strcpy(prior_map,read_map);
+		dstr_free_tokens(command_with_prefix, count1);
+	}//end of while (1)
 
- 	struct pollfd fds;
-	fds.fd = fd;
-	fds.events = POLLIN;
-
-	while(1)
-	{
-		if (strcmp(prior_map,read_map))
-		{
-			printf("input events\n");
-			strcpy(write_map,"from user space: input events");
-		}
-	}
-*/
-//-----------------------------------------------------------------------------------
 	dstr_free(fields);
-	dstr_free(command_with_timestamp);
+	dstr_free(command_with_prefix);
 	munmap(read_map, PAGE_SIZE);
 	munmap(write_map, PAGE_SIZE);
 	return 0;

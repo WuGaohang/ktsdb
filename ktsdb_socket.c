@@ -33,18 +33,20 @@ struct work_struct sock_work;
 
 #define DEVICE_READ "ktsdb_read"
 #define DEVICE_WRITE "ktsdb_write"
+#define WAIT_TIME 999999
 
+//开放端口号
 static const unsigned short server_port = 5555;
 static struct socket *serversocket=NULL;
 static DECLARE_COMPLETION(threadcomplete);
-static DECLARE_COMPLETION(IOcomplete);
 
 static int ktsdb_socket_server_pid;
 
-//static unsigned char *buffers;
 static unsigned char *read_buffers;
 static unsigned char *write_buffers;
-static unsigned char *timestamp;
+
+size_t count = 0;//记录连接的客户端总数
+size_t rmmod_flag = 0;//卸载模块时的标志位 flag = 1 表示模块将要被卸载，需要令所有客户端退出
 
 struct param_struct
 {
@@ -67,12 +69,11 @@ static int read_map(struct file *filp, struct vm_area_struct *vma)
  
 	if(remap_pfn_range(vma,start,page>>PAGE_SHIFT,size,PAGE_SHARED))
 		return -1;
-
 	return 0;
 }
 
 static int write_map(struct file *filp, struct vm_area_struct *vma)
-{    
+{
 	unsigned long page;
 	unsigned long start = (unsigned long)vma->vm_start;
 	unsigned long size = (unsigned long)(vma->vm_end - vma->vm_start);
@@ -110,15 +111,12 @@ static struct miscdevice misc_write = {
 	.fops = &dev_write_fops,
 };
 
-static int dev_init()
+static int dev_init(void)
 {
-
 	int ret1,ret2;
 
 	read_buffers = (unsigned char *)kmalloc(PAGE_SIZE,GFP_KERNEL);
 	write_buffers = (unsigned char *)kmalloc(PAGE_SIZE,GFP_KERNEL);
-
-	timestamp = (unsigned char*)kmalloc(sizeof(char)*15,GFP_KERNEL);
 
 	SetPageReserved(virt_to_page(read_buffers));
 	SetPageReserved(virt_to_page(write_buffers));
@@ -128,7 +126,7 @@ static int dev_init()
 	return 0;
 }
 
-static void dev_free()
+static void dev_free(void)
 {
 	misc_deregister(&misc_read);
 	misc_deregister(&misc_write);
@@ -136,8 +134,6 @@ static void dev_free()
 	ClearPageReserved(virt_to_page(write_buffers));
 	kfree(read_buffers);
 	kfree(write_buffers);
-
-	kfree(timestamp);
 }
 
 
@@ -164,7 +160,6 @@ static int create_socket(void)
 	if(servererror)
 		goto release;
 	return 0;
-
 release:
 	sock_release(serversocket);
 	printk(KERN_ERR "server: Error serversocket\n");
@@ -224,8 +219,7 @@ static int server_receive(struct socket *sptr, unsigned char *buf, int len)
 		return 0;
 
 	struct kvec iov = {buf, len};
-	struct msghdr msg = {.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL};
-
+	struct msghdr msg = {.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL};//非阻塞模式
 
 //	len = kernel_recvmsg(sptr, &msg, &iov, 1, len, 0);
 	len = kernel_recvmsg(sptr, &msg, &iov, 1, len, msg.msg_flags);
@@ -239,13 +233,25 @@ static void socket_work(struct work_struct *sock_work)
 	struct param_struct *ps = container_of(sock_work, struct param_struct, sock_work);
 
 	unsigned char buffer[100];
+	unsigned char client[100];
+	unsigned char timestamp[100];
+	unsigned char* temp;
 	static int len = 0;
-	int timestamp_len = 0;
+
+	unsigned char *return_timestamp;
+	unsigned char *return_client;
+	unsigned char *return_result;
+	return_result = (unsigned char *)kmalloc(PAGE_SIZE,GFP_KERNEL);
+	return_client= (unsigned char *)kmalloc(PAGE_SIZE,GFP_KERNEL);
+	return_timestamp= (unsigned char *)kmalloc(PAGE_SIZE,GFP_KERNEL);
 
 	while (1)
 	{
 		len = server_receive(ps->client, buffer, sizeof(buffer));
-		if (len > 0)
+		//server_receive采用非阻塞模式，断开连接的条件有两个：
+		//1：客户端主动退出，即server_receive的返回值len < 0;
+		//2：内核模块即将被卸载，命令所有客户端断开连接，即rmmod_flag == 1;
+		if (len > 0 && rmmod_flag == 0)
 		{
 			if (strstr(buffer, "\r\n") && len > 2)
 			{
@@ -253,75 +259,122 @@ static void socket_work(struct work_struct *sock_work)
 				buffer[len] = '\0';
 			}
 
-			//add timestamp
-			sprintf(timestamp,"%ld",jiffies);
+			//对命令进行处理，添加时间戳以及client标识
+			//添加时间戳，让用户态服务判断是否有新命令到达
+			sprintf(timestamp,"%ld",jiffies_64);
 			strcpy(read_buffers,timestamp);
-			strcat(read_buffers," ");
-			timestamp_len = strlen(timestamp);
-			len+=timestamp_len;
+			strcat(read_buffers," ");	
+			len+=strlen(timestamp);
 			len++;
+			//添加client标识
+			sprintf(client,"%p",ps->client);
+			strcat(read_buffers,client);
+			strcat(read_buffers," ");
+			len+=strlen(client);
+			len++;
+
 			strcat(read_buffers,buffer);
-		
-			schedule_timeout_uninterruptible(200);
+			int i = 0;
 
-			server_send(ps->client, write_buffers, strlen(write_buffers));
-			//send \r\n for test
-			server_send(ps->client, "\r\n", 2);
+			//等待结果，并将write_buffers中的返回结果发送出去
+			while(1)
+			{
+				i++;
+				if (rmmod_flag == 1 || i > WAIT_TIME)
+					break;
+				//处理返回结果，返回结果的格式为：时间戳+空格+客户端标识+空格+查询结果
+				strcpy(return_result, write_buffers);
+				if (strlen(return_result)!=0)
+				{
+					temp = strstr(return_result," ");
+					if (temp != NULL)
+					{
+						//取出返回结果中的时间戳，存在字符串return_timestamp中，剩下部分存在字符串return_result中
+						strncpy(return_timestamp,return_result,strlen(return_result)-strlen(temp));
+						return_timestamp[strlen(return_result)-strlen(temp)] = '\0';
+						strcpy(return_result, temp);
+						if (strlen(return_result)>1)
+						{
+							strcpy(return_result,return_result+1);//跳过空格
+							temp = strstr(return_result," ");
+							if (temp != NULL)
+							{
+								//取出返回结果中的客户端标识，存在字符串return_client中，剩下部分存在字符串return_result中
+								strncpy(return_client,return_result,strlen(return_result)-strlen(temp));
+								return_client[strlen(return_result)-strlen(temp)] = '\0';
+							}
+						}
 
+					}
+				}//end of if (strlen(return_result)!=0)
+				//当write_buffers中的时间戳和客户端标识与命令的时间戳、客户端标识匹配时，向相应的客户端发送消息
+				if (!strcmp(return_timestamp,timestamp) && !strcmp(return_client,client))
+				{
+					//读取write_buffers中 "return_timestamp空格return_client空格" 之后的内容(真正的返回结果)
+					strcpy(return_result, write_buffers+strlen(return_timestamp)+strlen(return_client)+2);
+					server_send(ps->client, return_result, strlen(return_result));
+					//send \r\n for test
+					server_send(ps->client, "\r\n", 2);
+					break;
+				}
+			}// end of while(1)
 		}
-		else if (len == 0)
+		else if (len == 0 || rmmod_flag == 1)
 		{
 			struct linger so_linger;
 			so_linger.l_onoff = 1;
 			so_linger.l_linger = 0;
-
 			kernel_setsockopt(ps->client, SOL_SOCKET, SO_LINGER,&so_linger,sizeof(so_linger));
-
 			sock_release(ps->client);
 			ps->client = NULL;
-
+			count--;//客户端计数减一
 			break;
 		}
 	}
+	kfree(return_result);
+	kfree(return_client);
+	kfree(return_timestamp);
 	return;
 }
 
-static int ktsdb_socket_server(void *data)
+//完成socket连接以及workqueue的调度
+static int ktsdb_socket_server(void)
 {
 	daemonize("ktsdb_socket");
+	//允许接收信号SIGTERM(终止进程)
 	allow_signal(SIGTERM);
 
 	struct param_struct ps[10];
-	int i = 0;
 
+	//当接收到信号时signal_pending返回值不为0
 	while(!signal_pending(current))
 	{
-		unsigned char buffer[100];
 		struct socket *clientsocket;
-		static int len;
 
+		//等待客户端socket连接
 		clientsocket = socket_accept(serversocket);
 		printk("clientsocket(%p)\n", clientsocket);
 
-
+		//当有客户端连接成功时，将其分配给workqueue进行调度
 		while(clientsocket)
 		{
-			ps[i].client = clientsocket;
-			INIT_WORK(&(ps[i].sock_work),socket_work);
-			queue_work(wq,&(ps[i].sock_work));
+			//相关参数填入结构体中
+			ps[count].client = clientsocket;
+			//workqueue 调度工作
+			INIT_WORK(&(ps[count].sock_work),socket_work);
+			queue_work(wq,&(ps[count].sock_work));
+			count++;//客户端计数加一
 			clientsocket = NULL;
-			i++;
 		}
 	}
-
 	complete(&threadcomplete);
 	return 0;
 }
 
+//内核模块入口，主要完成内存映射设备的初始化，workqueue的创建以及socket连接线程的创建
 static int __init server_init(void)
 {
 	dev_init();
-printk("jiff start:%ld\n",jiffies);
 	wq = create_workqueue("workqueue");
 
 	if(create_socket()<0)
@@ -338,9 +391,15 @@ printk("jiff start:%ld\n",jiffies);
 	return 0;
 }
 
+//卸载内核模块时执行，主要完成各种资源的释放
 static void __exit server_exit(void)
 {
 	printk("server_exit() %d\n",ktsdb_socket_server_pid);
+	
+	rmmod_flag = 1;//将卸载模块的标志位置为1，通知客户端断开连接
+	while (count != 0){schedule_timeout_uninterruptible(100);}//等待所有客户端断开连接
+
+	//向socket连接线程发送终止命令并等待其执行结束
 	if(ktsdb_socket_server_pid)
 	{
 		kill_pid(find_pid_ns(ktsdb_socket_server_pid, &init_pid_ns),
@@ -348,12 +407,9 @@ static void __exit server_exit(void)
 		wait_for_completion(&threadcomplete);
 	}
 	if(serversocket)
-	{
 		sock_release(serversocket);
-	}
 
 	destroy_workqueue(wq);
-printk("jiff end:%ld\n",jiffies);
 	dev_free();
 }
 
