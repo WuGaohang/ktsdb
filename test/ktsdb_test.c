@@ -117,12 +117,12 @@ int main(int argc , char *argv[])
 	fd_write = open("/dev/ktsdb_write",O_RDWR); // 读写映射
 
 	//line记录发送的原始消息
-	char *line = (char*)malloc(sizeof(char)*100);
+	char *line = (char*)malloc(sizeof(char)*2048);
 	//prior_timestamp保存前一个时间戳
-	char *prior_timestamp = (char*)malloc(sizeof(char)*100);
+	char *prior_timestamp = (char*)malloc(sizeof(char)*2048);
 	//client保存客户端标识
-	char *client = (char*)malloc(sizeof(char)*100);
-	result= (char*)malloc(sizeof(char)*200);
+	char *client = (char*)malloc(sizeof(char)*2048);
+	result= (char*)malloc(sizeof(char)*2048);
 
 	dstr *command_with_prefix = NULL;
 	dstr *fields = NULL;
@@ -138,7 +138,7 @@ int main(int argc , char *argv[])
 
 	write_map = (unsigned char *)mmap(0, PAGE_SIZE, PROT_WRITE, MAP_SHARED,fd_write, 0);
 	read_map = (unsigned char *)mmap(0, PAGE_SIZE, PROT_READ, MAP_SHARED,fd_read, 0);
-	
+
 	if (read_map == MAP_FAILED || write_map == MAP_FAILED)
 	{
 		printf("mmap fail %p  %p\n",read_map, write_map);
@@ -146,23 +146,25 @@ int main(int argc , char *argv[])
 		munmap(write_map, PAGE_SIZE);
 		return 0;
 	}
-
 	while (1)
 	{
-		strcpy(line, read_map);
-		command_with_prefix = dstr_split_len(line, strlen(line), " ", 1, &count1);
+		command_with_prefix = dstr_split_len(read_map, strlen(read_map), " ", 1, &count1);
 		//通过比较当前read_map中命令的时间戳与上一条命令的时间戳来判断是否有新的命令到达
-		if (count1 > 2 && strcmp(command_with_prefix[0],prior_timestamp))
+//		if (count1 > 2 && strcmp(command_with_prefix[0],prior_timestamp))
+		if (count1 > 2)
 		{
+printf("command:%s\n",read_map);
 			//初始化result;
 			strcpy(result,"");
 			//改写prior_timestamp时间戳
 			strcpy(prior_timestamp,command_with_prefix[0]);
 			//记录client标识
 			strcpy(client,command_with_prefix[1]);
+
 			strcpy(line, read_map+strlen(command_with_prefix[0])+strlen(command_with_prefix[1])+2);
 
 			fields = dstr_split_len(line, strlen(line), " ", 1, &count);
+
 			if (count > 0)
 			{
 				if (!strcmp(fields[0], "put"))
@@ -178,7 +180,8 @@ int main(int argc , char *argv[])
 							usage();
 							break;
 						default:
-							strcpy(result, "put success");
+							strcpy(result,fields[1]);
+							strcat(result, " put success");
 					}
 				}
 				else if (!strcmp(fields[0], "get"))
@@ -210,12 +213,18 @@ int main(int argc , char *argv[])
 					strcpy(result, "unknown command\n");
 					usage();
 				}
+				//当写缓存中不是允许写的状态时，等待
+				while (strcmp(write_map,"AllowChange"));
 				//add_prefix: 将字符串result与prior_timestamp连接并赋值给write_map
 				add_prefix(result,result,client);
 				add_prefix(write_map,result,prior_timestamp);
+printf("result:%s\n",write_map);
 			}//end of if (count > 0)
 			dstr_free_tokens(fields, count);
-		}
+			//向内核回复“可读”
+			strcpy(read_map,"AllowChange");
+			read_map[11]='\0';
+		}//end of if (count1 > 2 && strcmp(command_with_prefix[0],prior_timestamp))
 		dstr_free_tokens(command_with_prefix, count1);
 	}//end of while (1)
 
